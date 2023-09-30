@@ -1,10 +1,14 @@
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::error::Error;
+use std::fmt::{Debug, Display};
 use std::fs::File;
 use std::io::{Read, Write};
 
 use thiserror::Error;
+use uuid::Uuid;
+
+const DEBUG_FILE_PATH: &str = "/home/cryme/RustroverProjects/maelstorm_distrib_challanges/res.txt";
 
 fn main() {
     let std_in = std::io::stdin().lock();
@@ -21,6 +25,7 @@ enum NodeState {
     Initialized,
 }
 
+#[allow(dead_code)]
 #[derive(Error, Debug)]
 enum NodeError {
     #[error("Unacceptable payload type: {0} for state: {1:#?}")]
@@ -36,6 +41,7 @@ enum NodeError {
 struct Node<Input, Output> {
     state: NodeState,
     next_message_id: i32,
+    #[cfg(feature = "log_to_file")]
     log_file: File,
     id: Option<String>,
     all_node_ids: Vec<String>,
@@ -48,15 +54,18 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
         Self {
             state: NodeState::Created,
             next_message_id: i32::MIN,
-            log_file: File::create(
-                "/home/cryme/RustroverProjects/maelstorm_distrib_challanges/res.txt",
-            )
-            .unwrap(),
+            #[cfg(feature = "log_to_file")]
+            log_file: File::create(DEBUG_FILE_PATH).unwrap(),
             id: None,
             all_node_ids: Vec::new(),
             input: Some(input),
             output,
         }
+    }
+
+    fn log_to_file(&mut self, data: &dyn Display) {
+        #[cfg(feature = "log_to_file")]
+        writeln!(self.log_file, "{data}").unwrap();
     }
 
     fn next_message_id(&mut self) -> i32 {
@@ -70,14 +79,14 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
             return;
         }
 
-        writeln!(self.log_file, "Created!").unwrap();
+        self.log_to_file(&"Created!");
 
         let input = self.input.take().unwrap();
 
         let msg = serde_json::Deserializer::from_reader(input).into_iter::<Message>();
 
         for m in msg {
-            writeln!(self.log_file, "\n--> {m:#?}").unwrap();
+            self.log_to_file(&"\n--> {m:#?}");
 
             let Ok(message) = m else { continue };
 
@@ -91,9 +100,9 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
 
         data.push('\n');
 
-        writeln!(self.log_file, "\n<-- {data}").unwrap();
+        self.log_to_file(&"\n<-- {data}");
         self.output.write_all(data.as_bytes()).unwrap();
-        writeln!(self.log_file, "\n--").unwrap();
+        self.log_to_file(&"\n--");
     }
 
     fn wrap_err(&self, err: NodeError) -> Payload {
@@ -143,9 +152,12 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
                 Ok(Payload::EchoOk { echo })
             }
 
-            Payload::EchoOk { .. } | Payload::InitOk => Err(NodeError::IllegalPayloadType),
+            Payload::Generate => Ok(Payload::GenerateOk { id: Uuid::new_v4() }),
 
-            _ => Err(NodeError::CurrentlyUnsupported),
+            Payload::EchoOk { .. }
+            | Payload::Error { .. }
+            | Payload::InitOk
+            | Payload::GenerateOk { .. } => Err(NodeError::IllegalPayloadType),
         }
     }
 
@@ -207,12 +219,19 @@ enum Payload {
         node_ids: Vec<String>,
     },
     InitOk,
+
     Echo {
         echo: String,
     },
     EchoOk {
         echo: String,
     },
+
+    Generate,
+    GenerateOk {
+        id: Uuid,
+    },
+
     Error {
         code: MaelstromError,
         text: String,

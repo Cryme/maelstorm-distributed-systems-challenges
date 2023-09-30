@@ -12,3 +12,8 @@ serde_repr = { version = "0.1" }
 anyhow = { version = "1" }
 thiserror = { version = "1" }
 serde_with = { version = "3.3" }
+uuid = { version = "1.4", features = ["v4", "serde"] }
+
+[features]
+default = ["log_to_file"]
+log_to_file = []
