@@ -1,6 +1,6 @@
-use std::error::Error;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
+use std::error::Error;
 use std::fs::File;
 use std::io::{Read, Write};
 
@@ -143,11 +143,9 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
                 Ok(Payload::EchoOk { echo })
             }
 
-            Payload::EchoOk { .. } | Payload::InitOk => {
-                Err(NodeError::IllegalPayloadType)
-            }
+            Payload::EchoOk { .. } | Payload::InitOk => Err(NodeError::IllegalPayloadType),
 
-            _ => Err(NodeError::CurrentlyUnsupported,)
+            _ => Err(NodeError::CurrentlyUnsupported),
         }
     }
 
