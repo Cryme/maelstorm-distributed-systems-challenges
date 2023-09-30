@@ -1,3 +1,4 @@
+use std::error::Error;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::fs::File;
@@ -108,17 +109,17 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
         }
     }
 
-    fn proceed_message(&mut self, message: Message) -> Payload {
+    fn proceed_message(&mut self, message: Message) -> Result<Payload, NodeError> {
         if let Some(id) = &self.id {
             if id != &message.dst {
-                return self.wrap_err(NodeError::NodeIdMismatch);
+                return Err(NodeError::NodeIdMismatch);
             }
         }
 
         match message.body.payload {
             Payload::Init { node_id, node_ids } => {
                 if self.state != NodeState::Created {
-                    return self.wrap_err(NodeError::UnacceptablePayloadType(
+                    return Err(NodeError::UnacceptablePayloadType(
                         "Init".to_string(),
                         self.state,
                     ));
@@ -128,34 +129,43 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
                 self.all_node_ids = node_ids;
                 self.state = NodeState::Initialized;
 
-                Payload::InitOk
+                Ok(Payload::InitOk)
             }
 
             Payload::Echo { echo } => {
                 if self.state != NodeState::Initialized {
-                    return self.wrap_err(NodeError::UnacceptablePayloadType(
+                    return Err(NodeError::UnacceptablePayloadType(
                         "Echo".to_string(),
                         self.state,
                     ));
                 }
 
-                Payload::EchoOk { echo }
+                Ok(Payload::EchoOk { echo })
             }
 
             Payload::EchoOk { .. } | Payload::InitOk => {
-                self.wrap_err(NodeError::IllegalPayloadType)
+                Err(NodeError::IllegalPayloadType)
             }
 
-            _ => self.wrap_err(NodeError::CurrentlyUnsupported),
+            _ => Err(NodeError::CurrentlyUnsupported,)
         }
     }
+
+    fn on_err(&mut self, _error: &dyn Error) {}
 
     fn build_reply(&mut self, message: Message) -> Message {
         let dst = message.dst.clone();
         let src = message.src.clone();
         let msg_id = message.body.msg_id;
 
-        let payload = self.proceed_message(message);
+        let payload = match self.proceed_message(message) {
+            Ok(payload) => payload,
+            Err(e) => {
+                self.on_err(&e);
+
+                self.wrap_err(e)
+            }
+        };
 
         Message {
             src: if let Some(id) = &self.id {
