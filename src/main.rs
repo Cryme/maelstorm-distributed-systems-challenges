@@ -1,24 +1,175 @@
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
+
+use thiserror::Error;
 
 fn main() {
-    let mut file =
-        File::create("/home/cryme/RustroverProjects/maelstorm_distrib_challanges/res.txt").unwrap();
-    writeln!(file, "Created!").unwrap();
     let std_in = std::io::stdin().lock();
-    let mut std_out = std::io::stdout().lock();
+    let std_out = std::io::stdout().lock();
 
-    let msg = serde_json::Deserializer::from_reader(std_in).into_iter::<Message>();
+    let node = Node::new(std_in, std_out);
 
-    for m in msg {
-        writeln!(file, "\n--> {m:#?}").unwrap();
-        let mut rep = serde_json::to_string(&m.unwrap().into_reply()).unwrap();
-        rep.push_str("\n");
-        writeln!(file, "\n<-- {rep}").unwrap();
-        std_out.write(rep.as_bytes()).unwrap();
-        writeln!(file, "\n--").unwrap();
+    node.run();
+}
+
+#[derive(PartialEq, Debug, Copy, Clone)]
+enum NodeState {
+    Created,
+    Initialized,
+}
+
+#[derive(Error, Debug)]
+enum NodeError {
+    #[error("Unacceptable payload type: {0} for state: {1:#?}")]
+    UnacceptablePayloadType(String, NodeState),
+    #[error("Support unimplemented type")]
+    CurrentlyUnsupported,
+    #[error("Bad payload type")]
+    IllegalPayloadType,
+    #[error("Node id mismatch")]
+    NodeIdMismatch,
+}
+
+struct Node<Input, Output> {
+    state: NodeState,
+    next_message_id: i32,
+    log_file: File,
+    id: Option<String>,
+    all_node_ids: Vec<String>,
+    input: Option<Input>,
+    output: Output,
+}
+
+impl<Input: Read, Output: Write> Node<Input, Output> {
+    fn new(input: Input, output: Output) -> Node<Input, Output> {
+        Self {
+            state: NodeState::Created,
+            next_message_id: i32::MIN,
+            log_file: File::create(
+                "/home/cryme/RustroverProjects/maelstorm_distrib_challanges/res.txt",
+            )
+            .unwrap(),
+            id: None,
+            all_node_ids: Vec::new(),
+            input: Some(input),
+            output,
+        }
+    }
+
+    fn next_message_id(&mut self) -> i32 {
+        self.next_message_id += 1;
+
+        self.next_message_id
+    }
+
+    fn run(mut self) {
+        if self.input.is_none() {
+            return;
+        }
+
+        writeln!(self.log_file, "Created!").unwrap();
+
+        let input = self.input.take().unwrap();
+
+        let msg = serde_json::Deserializer::from_reader(input).into_iter::<Message>();
+
+        for m in msg {
+            writeln!(self.log_file, "\n--> {m:#?}").unwrap();
+
+            let Ok(message) = m else { continue };
+
+            self.handle_message(message);
+        }
+    }
+
+    fn handle_message(&mut self, message: Message) {
+        let reply = self.build_reply(message);
+        let mut data = serde_json::to_string(&reply).unwrap();
+
+        data.push('\n');
+
+        writeln!(self.log_file, "\n<-- {data}").unwrap();
+        self.output.write_all(data.as_bytes()).unwrap();
+        writeln!(self.log_file, "\n--").unwrap();
+    }
+
+    fn wrap_err(&self, err: NodeError) -> Payload {
+        Payload::Error {
+            code: match &err {
+                NodeError::UnacceptablePayloadType(..)
+                | NodeError::IllegalPayloadType
+                | NodeError::NodeIdMismatch => MaelstromError::MalformedRequest,
+
+                NodeError::CurrentlyUnsupported => MaelstromError::NotSupported,
+            },
+            text: format!("{err:#?}"),
+        }
+    }
+
+    fn proceed_message(&mut self, message: Message) -> Payload {
+        if let Some(id) = &self.id {
+            if id != &message.dst {
+                return self.wrap_err(NodeError::NodeIdMismatch);
+            }
+        }
+
+        match message.body.payload {
+            Payload::Init { node_id, node_ids } => {
+                if self.state != NodeState::Created {
+                    return self.wrap_err(NodeError::UnacceptablePayloadType(
+                        "Init".to_string(),
+                        self.state,
+                    ));
+                }
+
+                self.id = Some(node_id);
+                self.all_node_ids = node_ids;
+                self.state = NodeState::Initialized;
+
+                Payload::InitOk
+            }
+
+            Payload::Echo { echo } => {
+                if self.state != NodeState::Initialized {
+                    return self.wrap_err(NodeError::UnacceptablePayloadType(
+                        "Echo".to_string(),
+                        self.state,
+                    ));
+                }
+
+                Payload::EchoOk { echo }
+            }
+
+            Payload::EchoOk { .. } | Payload::InitOk => {
+                self.wrap_err(NodeError::IllegalPayloadType)
+            }
+
+            _ => self.wrap_err(NodeError::CurrentlyUnsupported),
+        }
+    }
+
+    fn build_reply(&mut self, message: Message) -> Message {
+        let dst = message.dst.clone();
+        let src = message.src.clone();
+        let msg_id = message.body.msg_id;
+
+        let payload = self.proceed_message(message);
+
+        Message {
+            src: if let Some(id) = &self.id {
+                id.clone()
+            } else {
+                dst
+            },
+            dst: src,
+            body: Body {
+                msg_id: Some(self.next_message_id()),
+                in_reply_to: msg_id,
+                payload,
+            },
+        }
     }
 }
 
@@ -30,27 +181,7 @@ struct Message {
     body: Body,
 }
 
-impl Message {
-    fn into_reply(self) -> Self {
-        Self {
-            src: self.dst,
-            dst: self.src,
-            body: Body {
-                msg_id: None,
-                in_reply_to: self.body.msg_id,
-                payload: match self.body.payload {
-                    Payload::Init { .. } => Payload::InitOk,
-                    Payload::Echo { echo } => Payload::EchoOk { echo },
-
-                    _ => {
-                        unimplemented!()
-                    }
-                },
-            },
-        }
-    }
-}
-
+#[serde_with::skip_serializing_none]
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Body {
     msg_id: Option<i32>,
@@ -74,9 +205,13 @@ enum Payload {
     EchoOk {
         echo: String,
     },
+    Error {
+        code: MaelstromError,
+        text: String,
+    },
 }
 
-#[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug)]
+#[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug, Clone)]
 #[repr(u8)]
 enum MaelstromError {
     /**
