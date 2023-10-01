@@ -8,6 +8,7 @@ use std::io::{Read, Write};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(feature = "log_to_file")]
 const DEBUG_FILE_PATH: &str = "/home/cryme/RustroverProjects/maelstorm_distrib_challanges/res.txt";
 
 fn main() {
@@ -45,6 +46,8 @@ struct Node<Input, Output> {
     log_file: File,
     id: Option<String>,
     all_node_ids: Vec<String>,
+    broadcast_messages: Vec<i32>,
+    topology: Option<serde_json::Value>,
     input: Option<Input>,
     output: Output,
 }
@@ -58,6 +61,8 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
             log_file: File::create(DEBUG_FILE_PATH).unwrap(),
             id: None,
             all_node_ids: Vec::new(),
+            broadcast_messages: Vec::new(),
+            topology: None,
             input: Some(input),
             output,
         }
@@ -86,7 +91,7 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
         let msg = serde_json::Deserializer::from_reader(input).into_iter::<Message>();
 
         for m in msg {
-            self.log_to_file(&"\n--> {m:#?}");
+            self.log_to_file(&format!("\n--> {m:#?}"));
 
             let Ok(message) = m else { continue };
 
@@ -100,7 +105,7 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
 
         data.push('\n');
 
-        self.log_to_file(&"\n<-- {data}");
+        self.log_to_file(&format!("\n<-- {data}"));
         self.output.write_all(data.as_bytes()).unwrap();
         self.log_to_file(&"\n--");
     }
@@ -154,9 +159,27 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
 
             Payload::Generate => Ok(Payload::GenerateOk { id: Uuid::new_v4() }),
 
+            Payload::Broadcast { message } => {
+                self.broadcast_messages.push(message);
+                Ok(Payload::BroadcastOk)
+            }
+
+            Payload::Read => Ok(Payload::ReadOk {
+                messages: self.broadcast_messages.clone(),
+            }),
+
+            Payload::Topology(v) => {
+                self.topology = Some(v);
+
+                Ok(Payload::TopologyOk)
+            }
+
             Payload::EchoOk { .. }
             | Payload::Error { .. }
             | Payload::InitOk
+            | Payload::BroadcastOk
+            | Payload::ReadOk { .. }
+            | Payload::TopologyOk
             | Payload::GenerateOk { .. } => Err(NodeError::IllegalPayloadType),
         }
     }
@@ -231,6 +254,19 @@ enum Payload {
     GenerateOk {
         id: Uuid,
     },
+
+    Broadcast {
+        message: i32,
+    },
+    BroadcastOk,
+
+    Read,
+    ReadOk {
+        messages: Vec<i32>,
+    },
+
+    Topology(serde_json::Value),
+    TopologyOk,
 
     Error {
         code: MaelstromError,
