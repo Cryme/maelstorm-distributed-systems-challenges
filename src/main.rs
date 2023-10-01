@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::error::Error;
 use std::fmt::{Debug, Display};
+#[cfg(feature = "log_to_file")]
 use std::fs::File;
 use std::io::{Read, Write};
 
@@ -35,8 +36,12 @@ enum NodeError {
     CurrentlyUnsupported,
     #[error("Bad payload type")]
     IllegalPayloadType,
+    #[error("Bad payload")]
+    IllegalPayload,
     #[error("Node id mismatch")]
     NodeIdMismatch,
+    #[error("")]
+    DontReply,
 }
 
 struct Node<Input, Output> {
@@ -46,8 +51,13 @@ struct Node<Input, Output> {
     log_file: File,
     id: Option<String>,
     all_node_ids: Vec<String>,
+    #[cfg(feature = "broadcast")]
     broadcast_messages: Vec<i32>,
-    topology: Option<serde_json::Value>,
+    #[cfg(feature = "broadcast")]
+    heard_rumors: Vec<Uuid>,
+    #[cfg(feature = "counter")]
+    grow_value: u32,
+    neighbours: Vec<String>,
     input: Option<Input>,
     output: Output,
 }
@@ -61,13 +71,20 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
             log_file: File::create(DEBUG_FILE_PATH).unwrap(),
             id: None,
             all_node_ids: Vec::new(),
+            #[cfg(feature = "broadcast")]
             broadcast_messages: Vec::new(),
-            topology: None,
+            #[cfg(feature = "broadcast")]
+            heard_rumors: Vec::new(),
+            #[cfg(feature = "counter")]
+            grow_value: 0,
+            #[cfg(feature = "broadcast")]
+            neighbours: Vec::new(),
             input: Some(input),
             output,
         }
     }
 
+    #[allow(unused_variables)]
     fn log_to_file(&mut self, data: &dyn Display) {
         #[cfg(feature = "log_to_file")]
         writeln!(self.log_file, "{data}").unwrap();
@@ -100,8 +117,13 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
     }
 
     fn handle_message(&mut self, message: Message) {
-        let reply = self.build_reply(message);
-        let mut data = serde_json::to_string(&reply).unwrap();
+        if let Some(reply) = self.build_reply(message) {
+            self.send_to_network(&reply);
+        }
+    }
+
+    fn send_to_network<T: Sized + Serialize>(&mut self, data: &T) {
+        let mut data = serde_json::to_string(data).unwrap();
 
         data.push('\n');
 
@@ -110,14 +132,29 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
         self.log_to_file(&"\n--");
     }
 
+    fn spread(&mut self, payload: Payload) {
+        let Some(id) = self.id.clone() else {
+            return;
+        };
+
+        for neighbour in self.neighbours.clone() {
+            let message = self.wrap_payload(payload.clone(), id.clone(), neighbour, None);
+
+            self.send_to_network(&message);
+        }
+    }
+
     fn wrap_err(&self, err: NodeError) -> Payload {
         Payload::Error {
             code: match &err {
                 NodeError::UnacceptablePayloadType(..)
                 | NodeError::IllegalPayloadType
+                | NodeError::IllegalPayload
                 | NodeError::NodeIdMismatch => MaelstromError::MalformedRequest,
 
                 NodeError::CurrentlyUnsupported => MaelstromError::NotSupported,
+
+                NodeError::DontReply => unreachable!(),
             },
             text: format!("{err:#?}"),
         }
@@ -159,34 +196,115 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
 
             Payload::Generate => Ok(Payload::GenerateOk { id: Uuid::new_v4() }),
 
+            #[cfg(feature = "broadcast")]
             Payload::Broadcast { message } => {
                 self.broadcast_messages.push(message);
+
+                let rumor_id = Uuid::new_v4();
+                self.heard_rumors.push(rumor_id);
+
+                let rumor = Payload::Rumor {
+                    id: rumor_id,
+                    data: message,
+                };
+
+                self.spread(rumor);
+
                 Ok(Payload::BroadcastOk)
             }
 
+            #[cfg(feature = "counter")]
+            Payload::Add { delta } => {
+                self.grow_value += delta;
+
+                Ok(Payload::AddOk)
+            }
+
             Payload::Read => Ok(Payload::ReadOk {
+                #[cfg(feature = "broadcast")]
                 messages: self.broadcast_messages.clone(),
+                #[cfg(feature = "counter")]
+                value: self.grow_value,
             }),
 
-            Payload::Topology(v) => {
-                self.topology = Some(v);
+            #[cfg(feature = "broadcast")]
+            Payload::Topology { topology } => {
+                let Some(id) = self.id.clone() else {
+                    return Err(NodeError::UnacceptablePayloadType(
+                        "Topology".to_string(),
+                        self.state,
+                    ));
+                };
+
+                let Some(val) = topology.as_object() else {
+                    return Err(NodeError::IllegalPayload);
+                };
+
+                let Some(val) = val.get(&id) else {
+                    return Err(NodeError::IllegalPayload);
+                };
+
+                let Ok(top) = serde_json::from_value(val.clone()) else {
+                    return Err(NodeError::IllegalPayload);
+                };
+
+                self.neighbours = top;
+
+                self.log_to_file(&format!("node {id} -: {:#?}", self.neighbours));
 
                 Ok(Payload::TopologyOk)
             }
 
+            #[cfg(feature = "broadcast")]
+            Payload::Rumor { id, data } => {
+                if !self.heard_rumors.contains(&id) {
+                    self.broadcast_messages.push(data);
+                    self.heard_rumors.push(id);
+
+                    self.spread(Payload::Rumor { id, data });
+                }
+
+                Ok(Payload::RumorOk)
+            }
+
+            Payload::Error { .. } => Err(NodeError::IllegalPayloadType),
+
             Payload::EchoOk { .. }
-            | Payload::Error { .. }
             | Payload::InitOk
             | Payload::BroadcastOk
             | Payload::ReadOk { .. }
             | Payload::TopologyOk
-            | Payload::GenerateOk { .. } => Err(NodeError::IllegalPayloadType),
+            | Payload::AddOk
+            | Payload::RumorOk
+            | Payload::GenerateOk { .. } => Err(NodeError::DontReply),
         }
     }
 
     fn on_err(&mut self, _error: &dyn Error) {}
 
-    fn build_reply(&mut self, message: Message) -> Message {
+    fn wrap_payload(
+        &mut self,
+        payload: Payload,
+        src: String,
+        dst: String,
+        msg_id: Option<i32>,
+    ) -> Message {
+        Message {
+            src: if let Some(id) = &self.id {
+                id.clone()
+            } else {
+                src
+            },
+            dst,
+            body: Body {
+                msg_id: Some(self.next_message_id()),
+                in_reply_to: msg_id,
+                payload,
+            },
+        }
+    }
+
+    fn build_reply(&mut self, message: Message) -> Option<Message> {
         let dst = message.dst.clone();
         let src = message.src.clone();
         let msg_id = message.body.msg_id;
@@ -194,25 +312,17 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
         let payload = match self.proceed_message(message) {
             Ok(payload) => payload,
             Err(e) => {
+                if let NodeError::DontReply = e {
+                    return None;
+                }
+
                 self.on_err(&e);
 
                 self.wrap_err(e)
             }
         };
 
-        Message {
-            src: if let Some(id) = &self.id {
-                id.clone()
-            } else {
-                dst
-            },
-            dst: src,
-            body: Body {
-                msg_id: Some(self.next_message_id()),
-                in_reply_to: msg_id,
-                payload,
-            },
-        }
+        Some(self.wrap_payload(payload, dst, src, msg_id))
     }
 }
 
@@ -255,18 +365,38 @@ enum Payload {
         id: Uuid,
     },
 
+    #[cfg(feature = "broadcast")]
     Broadcast {
         message: i32,
     },
     BroadcastOk,
 
+    #[cfg(feature = "counter")]
+    Add {
+        delta: u32,
+    },
+    AddOk,
+
     Read,
     ReadOk {
+        #[cfg(feature = "broadcast")]
         messages: Vec<i32>,
+        #[cfg(feature = "counter")]
+        value: u32,
     },
 
-    Topology(serde_json::Value),
+    #[cfg(feature = "broadcast")]
+    Topology {
+        topology: serde_json::Value,
+    },
     TopologyOk,
+
+    #[cfg(feature = "broadcast")]
+    Rumor {
+        id: Uuid,
+        data: i32,
+    },
+    RumorOk,
 
     Error {
         code: MaelstromError,
