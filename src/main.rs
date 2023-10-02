@@ -40,8 +40,6 @@ enum NodeError {
     IllegalPayload,
     #[error("Node id mismatch")]
     NodeIdMismatch,
-    #[error("")]
-    DontReply,
 }
 
 struct Node<Input, Output> {
@@ -132,12 +130,16 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
         self.log_to_file(&"\n--");
     }
 
-    fn spread(&mut self, payload: Payload) {
+    fn spread(&mut self, payload: Payload, exclude: &str) {
         let Some(id) = self.id.clone() else {
             return;
         };
 
         for neighbour in self.neighbours.clone() {
+            if neighbour == exclude {
+                continue;
+            }
+
             let message = self.wrap_payload(payload.clone(), id.clone(), neighbour, None);
 
             self.send_to_network(&message);
@@ -153,8 +155,6 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
                 | NodeError::NodeIdMismatch => MaelstromError::MalformedRequest,
 
                 NodeError::CurrentlyUnsupported => MaelstromError::NotSupported,
-
-                NodeError::DontReply => unreachable!(),
             },
             text: format!("{err:#?}"),
         }
@@ -197,18 +197,15 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
             Payload::Generate => Ok(Payload::GenerateOk { id: Uuid::new_v4() }),
 
             #[cfg(feature = "broadcast")]
-            Payload::Broadcast { message } => {
-                self.broadcast_messages.push(message);
+            Payload::Broadcast { data } => {
+                self.broadcast_messages.push(data);
 
                 let rumor_id = Uuid::new_v4();
                 self.heard_rumors.push(rumor_id);
 
-                let rumor = Payload::Rumor {
-                    id: rumor_id,
-                    data: message,
-                };
+                let rumor = Payload::Rumor { id: rumor_id, data };
 
-                self.spread(rumor);
+                self.spread(rumor, &message.src);
 
                 Ok(Payload::BroadcastOk)
             }
@@ -261,22 +258,23 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
                     self.broadcast_messages.push(data);
                     self.heard_rumors.push(id);
 
-                    self.spread(Payload::Rumor { id, data });
+                    self.spread(Payload::Rumor { id, data }, &message.src);
                 }
 
-                Ok(Payload::RumorOk)
+                Ok(Payload::DontReply)
             }
 
-            Payload::Error { .. } => Err(NodeError::IllegalPayloadType),
+            Payload::DontReply => Err(NodeError::IllegalPayloadType),
 
             Payload::EchoOk { .. }
+            | Payload::Error { .. }
             | Payload::InitOk
             | Payload::BroadcastOk
             | Payload::ReadOk { .. }
             | Payload::TopologyOk
             | Payload::AddOk
             | Payload::RumorOk
-            | Payload::GenerateOk { .. } => Err(NodeError::DontReply),
+            | Payload::GenerateOk { .. } => Ok(Payload::DontReply),
         }
     }
 
@@ -310,12 +308,14 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
         let msg_id = message.body.msg_id;
 
         let payload = match self.proceed_message(message) {
-            Ok(payload) => payload,
-            Err(e) => {
-                if let NodeError::DontReply = e {
+            Ok(payload) => {
+                if let Payload::DontReply = payload {
                     return None;
                 }
 
+                payload
+            }
+            Err(e) => {
                 self.on_err(&e);
 
                 self.wrap_err(e)
@@ -367,7 +367,8 @@ enum Payload {
 
     #[cfg(feature = "broadcast")]
     Broadcast {
-        message: i32,
+        #[serde(rename = "message")]
+        data: i32,
     },
     BroadcastOk,
 
@@ -397,6 +398,8 @@ enum Payload {
         data: i32,
     },
     RumorOk,
+
+    DontReply,
 
     Error {
         code: MaelstromError,
