@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt::{Debug, Display};
 #[cfg(feature = "log_to_file")]
@@ -7,7 +8,6 @@ use std::fs::File;
 use std::io::{Read, Write};
 
 use thiserror::Error;
-use uuid::Uuid;
 
 #[cfg(feature = "log_to_file")]
 const DEBUG_FILE_PATH: &str = "/home/cryme/RustroverProjects/maelstorm_distrib_challanges/res.txt";
@@ -21,17 +21,17 @@ fn main() {
     node.run();
 }
 
-#[derive(PartialEq, Debug, Copy, Clone)]
+#[derive(PartialEq, Debug, Clone)]
 enum NodeState {
     Created,
-    Initialized,
+    Initialized { id: String },
 }
 
 #[allow(dead_code)]
 #[derive(Error, Debug)]
 enum NodeError {
-    #[error("Unacceptable payload type: {0} for state: {1:#?}")]
-    UnacceptablePayloadType(String, NodeState),
+    #[error("Unacceptable payload for state: {0:#?}")]
+    UnacceptablePayloadForState(NodeState),
     #[error("Support unimplemented type")]
     CurrentlyUnsupported,
     #[error("Bad payload type")]
@@ -47,15 +47,9 @@ struct Node<Input, Output> {
     next_message_id: i32,
     #[cfg(feature = "log_to_file")]
     log_file: File,
-    id: Option<String>,
     all_node_ids: Vec<String>,
-    #[cfg(feature = "broadcast")]
-    broadcast_messages: Vec<i32>,
-    #[cfg(feature = "broadcast")]
-    heard_rumors: Vec<Uuid>,
-    #[cfg(feature = "counter")]
-    grow_value: u32,
-    neighbours: Vec<String>,
+    message_storage: HashMap<String, Vec<usize>>,
+    commit_offsets: HashMap<String, usize>,
     input: Option<Input>,
     output: Output,
 }
@@ -67,16 +61,9 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
             next_message_id: i32::MIN,
             #[cfg(feature = "log_to_file")]
             log_file: File::create(DEBUG_FILE_PATH).unwrap(),
-            id: None,
             all_node_ids: Vec::new(),
-            #[cfg(feature = "broadcast")]
-            broadcast_messages: Vec::new(),
-            #[cfg(feature = "broadcast")]
-            heard_rumors: Vec::new(),
-            #[cfg(feature = "counter")]
-            grow_value: 0,
-            #[cfg(feature = "broadcast")]
-            neighbours: Vec::new(),
+            message_storage: HashMap::new(),
+            commit_offsets: HashMap::new(),
             input: Some(input),
             output,
         }
@@ -130,26 +117,10 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
         self.log_to_file(&"\n--");
     }
 
-    fn spread(&mut self, payload: Payload, exclude: &str) {
-        let Some(id) = self.id.clone() else {
-            return;
-        };
-
-        for neighbour in self.neighbours.clone() {
-            if neighbour == exclude {
-                continue;
-            }
-
-            let message = self.wrap_payload(payload.clone(), id.clone(), neighbour, None);
-
-            self.send_to_network(&message);
-        }
-    }
-
     fn wrap_err(&self, err: NodeError) -> Payload {
         Payload::Error {
             code: match &err {
-                NodeError::UnacceptablePayloadType(..)
+                NodeError::UnacceptablePayloadForState(..)
                 | NodeError::IllegalPayloadType
                 | NodeError::IllegalPayload
                 | NodeError::NodeIdMismatch => MaelstromError::MalformedRequest,
@@ -161,120 +132,92 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
     }
 
     fn proceed_message(&mut self, message: Message) -> Result<Payload, NodeError> {
-        if let Some(id) = &self.id {
-            if id != &message.dst {
-                return Err(NodeError::NodeIdMismatch);
-            }
-        }
+        match &self.state {
+            NodeState::Created => match message.body.payload {
+                Payload::Init { node_id, node_ids } => {
+                    if self.state != NodeState::Created {
+                        return Err(NodeError::UnacceptablePayloadForState(self.state.clone()));
+                    }
 
-        match message.body.payload {
-            Payload::Init { node_id, node_ids } => {
-                if self.state != NodeState::Created {
-                    return Err(NodeError::UnacceptablePayloadType(
-                        "Init".to_string(),
-                        self.state,
-                    ));
+                    self.all_node_ids = node_ids;
+                    self.state = NodeState::Initialized { id: node_id };
+
+                    Ok(Payload::InitOk)
                 }
 
-                self.id = Some(node_id);
-                self.all_node_ids = node_ids;
-                self.state = NodeState::Initialized;
+                _ => Err(NodeError::UnacceptablePayloadForState(self.state.clone())),
+            },
 
-                Ok(Payload::InitOk)
-            }
-
-            Payload::Echo { echo } => {
-                if self.state != NodeState::Initialized {
-                    return Err(NodeError::UnacceptablePayloadType(
-                        "Echo".to_string(),
-                        self.state,
-                    ));
+            NodeState::Initialized { id } => {
+                if id != &message.dst {
+                    return Err(NodeError::NodeIdMismatch);
                 }
 
-                Ok(Payload::EchoOk { echo })
-            }
+                match message.body.payload {
+                    Payload::Send { key, msg } => {
+                        let offset = if let Some(v) = self.message_storage.get_mut(&key) {
+                            v.push(msg);
 
-            Payload::Generate => Ok(Payload::GenerateOk { id: Uuid::new_v4() }),
+                            v.len() - 1
+                        } else {
+                            self.message_storage.insert(key, vec![msg]);
 
-            #[cfg(feature = "broadcast")]
-            Payload::Broadcast { data } => {
-                self.broadcast_messages.push(data);
+                            0
+                        };
 
-                let rumor_id = Uuid::new_v4();
-                self.heard_rumors.push(rumor_id);
+                        Ok(Payload::SendOk { offset })
+                    }
 
-                let rumor = Payload::Rumor { id: rumor_id, data };
+                    Payload::Poll { offsets } => {
+                        let mut messages = BTreeMap::new();
+                        for (key, offset) in &offsets {
+                            if let Some(v) = self.message_storage.get(key) {
+                                let vals: Vec<[usize; 2]> = v[*offset..]
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, val)| [offset + i, *val])
+                                    .collect();
 
-                self.spread(rumor, &message.src);
+                                messages.insert(key.clone(), vals);
+                            }
+                        }
 
-                Ok(Payload::BroadcastOk)
-            }
+                        Ok(Payload::PollOk { messages })
+                    }
 
-            #[cfg(feature = "counter")]
-            Payload::Add { delta } => {
-                self.grow_value += delta;
+                    Payload::CommitOffsets { offsets } => {
+                        for (key, offset) in offsets {
+                            self.commit_offsets.insert(key, offset);
+                        }
 
-                Ok(Payload::AddOk)
-            }
+                        Ok(Payload::CommitOffsetsOk)
+                    }
 
-            Payload::Read => Ok(Payload::ReadOk {
-                #[cfg(feature = "broadcast")]
-                messages: self.broadcast_messages.clone(),
-                #[cfg(feature = "counter")]
-                value: self.grow_value,
-            }),
+                    Payload::ListCommittedOffsets { keys } => {
+                        let mut offsets = BTreeMap::new();
 
-            #[cfg(feature = "broadcast")]
-            Payload::Topology { topology } => {
-                let Some(id) = self.id.clone() else {
-                    return Err(NodeError::UnacceptablePayloadType(
-                        "Topology".to_string(),
-                        self.state,
-                    ));
-                };
+                        for key in keys {
+                            if let Some(val) = self.commit_offsets.get(&key) {
+                                offsets.insert(key, *val);
+                            }
+                        }
 
-                let Some(val) = topology.as_object() else {
-                    return Err(NodeError::IllegalPayload);
-                };
+                        Ok(Payload::ListCommittedOffsetsOk { offsets })
+                    }
 
-                let Some(val) = val.get(&id) else {
-                    return Err(NodeError::IllegalPayload);
-                };
+                    Payload::Error { .. }
+                    | Payload::CommitOffsetsOk
+                    | Payload::ListCommittedOffsetsOk { .. }
+                    | Payload::SendOk { .. }
+                    | Payload::PollOk { .. } => Ok(Payload::DontReply),
 
-                let Ok(top) = serde_json::from_value(val.clone()) else {
-                    return Err(NodeError::IllegalPayload);
-                };
+                    Payload::InitOk | Payload::DontReply => Err(NodeError::IllegalPayloadType),
 
-                self.neighbours = top;
-
-                self.log_to_file(&format!("node {id} -: {:#?}", self.neighbours));
-
-                Ok(Payload::TopologyOk)
-            }
-
-            #[cfg(feature = "broadcast")]
-            Payload::Rumor { id, data } => {
-                if !self.heard_rumors.contains(&id) {
-                    self.broadcast_messages.push(data);
-                    self.heard_rumors.push(id);
-
-                    self.spread(Payload::Rumor { id, data }, &message.src);
+                    Payload::Init { .. } => {
+                        Err(NodeError::UnacceptablePayloadForState(self.state.clone()))
+                    }
                 }
-
-                Ok(Payload::DontReply)
             }
-
-            Payload::DontReply => Err(NodeError::IllegalPayloadType),
-
-            Payload::EchoOk { .. }
-            | Payload::Error { .. }
-            | Payload::InitOk
-            | Payload::BroadcastOk
-            | Payload::ReadOk { .. }
-            | Payload::TopologyOk
-            | Payload::AddOk
-            | Payload::RumorOk
-            | Payload::GenerateOk { .. } => Ok(Payload::DontReply),
         }
     }
 
@@ -288,7 +231,7 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
         msg_id: Option<i32>,
     ) -> Message {
         Message {
-            src: if let Some(id) = &self.id {
+            src: if let NodeState::Initialized { id } = &self.state {
                 id.clone()
             } else {
                 src
@@ -353,51 +296,33 @@ enum Payload {
     },
     InitOk,
 
-    Echo {
-        echo: String,
+    Send {
+        key: String,
+        msg: usize,
     },
-    EchoOk {
-        echo: String,
-    },
-
-    Generate,
-    GenerateOk {
-        id: Uuid,
+    SendOk {
+        offset: usize,
     },
 
-    #[cfg(feature = "broadcast")]
-    Broadcast {
-        #[serde(rename = "message")]
-        data: i32,
+    Poll {
+        offsets: BTreeMap<String, usize>,
     },
-    BroadcastOk,
-
-    #[cfg(feature = "counter")]
-    Add {
-        delta: u32,
-    },
-    AddOk,
-
-    Read,
-    ReadOk {
-        #[cfg(feature = "broadcast")]
-        messages: Vec<i32>,
-        #[cfg(feature = "counter")]
-        value: u32,
+    PollOk {
+        #[serde(rename = "msgs")]
+        messages: BTreeMap<String, Vec<[usize; 2]>>,
     },
 
-    #[cfg(feature = "broadcast")]
-    Topology {
-        topology: serde_json::Value,
+    CommitOffsets {
+        offsets: BTreeMap<String, usize>,
     },
-    TopologyOk,
+    CommitOffsetsOk,
 
-    #[cfg(feature = "broadcast")]
-    Rumor {
-        id: Uuid,
-        data: i32,
+    ListCommittedOffsets {
+        keys: Vec<String>,
     },
-    RumorOk,
+    ListCommittedOffsetsOk {
+        offsets: BTreeMap<String, usize>,
+    },
 
     DontReply,
 

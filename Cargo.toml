@@ -15,7 +15,5 @@ serde_with = { version = "3.3" }
 uuid = { version = "1.4", features = ["v4", "serde"] }
 
 [features]
-default = ["broadcast", "log_to_file"]
+default = ["log_to_file"]
 log_to_file = []
-broadcast = []
-counter = []
