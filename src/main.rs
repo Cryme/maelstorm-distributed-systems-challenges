@@ -1,3 +1,5 @@
+mod storage;
+
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::collections::{BTreeMap, HashMap};
@@ -6,17 +8,53 @@ use std::fmt::{Debug, Display};
 #[cfg(feature = "log_to_file")]
 use std::fs::File;
 use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::thread::sleep;
+use std::time::Duration;
 
+use crate::storage::{ClientPacket, Storage, StoragePacket};
 use thiserror::Error;
 
 #[cfg(feature = "log_to_file")]
 const DEBUG_FILE_PATH: &str = "/home/cryme/RustroverProjects/maelstorm_distrib_challanges/res.txt";
 
+fn is_storage_spawned() -> bool {
+    let Ok(mut stream) = TcpStream::connect("127.0.0.1:14081") else {
+        return false;
+    };
+
+    let Ok(_) = stream.write(&bincode::serialize(&ClientPacket::Hello).unwrap()) else {
+        return false;
+    };
+
+    let mut buff = [0u8; 1024];
+
+    let Ok(count) = stream.read(&mut buff) else {
+        return false;
+    };
+
+    let Ok(packet) = bincode::deserialize::<StoragePacket>(&buff[..count]) else {
+        return false;
+    };
+
+    let StoragePacket::Hello = packet else {
+        return false;
+    };
+
+    true
+}
+
 fn main() {
+    if !is_storage_spawned() {
+        Storage::run();
+        sleep(Duration::from_secs(1));
+    }
+
     let std_in = std::io::stdin().lock();
     let std_out = std::io::stdout().lock();
+    let storage_connection = TcpStream::connect("127.0.0.1:14081").unwrap();
 
-    let node = Node::new(std_in, std_out);
+    let node = Node::new(std_in, std_out, storage_connection);
 
     node.run();
 }
@@ -40,29 +78,49 @@ enum NodeError {
     IllegalPayload,
     #[error("Node id mismatch")]
     NodeIdMismatch,
+    #[error("Storage connection error")]
+    StorageConnectionError,
 }
 
-struct Node<Input, Output> {
+struct Node<Input, Output, StorageConnection> {
+    connection: StorageConnection,
     state: NodeState,
     next_message_id: i32,
     #[cfg(feature = "log_to_file")]
     log_file: File,
     all_node_ids: Vec<String>,
-    message_storage: HashMap<String, Vec<usize>>,
     commit_offsets: HashMap<String, usize>,
     input: Option<Input>,
     output: Output,
 }
 
-impl<Input: Read, Output: Write> Node<Input, Output> {
-    fn new(input: Input, output: Output) -> Node<Input, Output> {
+impl<Input: Read, Output: Write, StorageConnection: Read + Write>
+    Node<Input, Output, StorageConnection>
+{
+    fn send(&mut self, packet: ClientPacket) -> anyhow::Result<StoragePacket> {
+        let mut res = [0u8; 1024];
+
+        let d = bincode::serialize(&packet)?;
+
+        let _ = self.connection.write(&d)?;
+
+        let count = self.connection.read(&mut res)?;
+
+        Ok(bincode::deserialize(&res[..count])?)
+    }
+
+    fn new(
+        input: Input,
+        output: Output,
+        storage_connection: StorageConnection,
+    ) -> Node<Input, Output, StorageConnection> {
         Self {
+            connection: storage_connection,
             state: NodeState::Created,
             next_message_id: i32::MIN,
             #[cfg(feature = "log_to_file")]
             log_file: File::create(DEBUG_FILE_PATH).unwrap(),
             all_node_ids: Vec::new(),
-            message_storage: HashMap::new(),
             commit_offsets: HashMap::new(),
             input: Some(input),
             output,
@@ -126,6 +184,7 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
                 | NodeError::NodeIdMismatch => MaelstromError::MalformedRequest,
 
                 NodeError::CurrentlyUnsupported => MaelstromError::NotSupported,
+                NodeError::StorageConnectionError => MaelstromError::Crash,
             },
             text: format!("{err:#?}"),
         }
@@ -155,14 +214,17 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
 
                 match message.body.payload {
                     Payload::Send { key, msg } => {
-                        let offset = if let Some(v) = self.message_storage.get_mut(&key) {
-                            v.push(msg);
+                        let offset = self.send(ClientPacket::Store {
+                            key: key.clone(),
+                            msg,
+                        });
 
-                            v.len() - 1
-                        } else {
-                            self.message_storage.insert(key, vec![msg]);
+                        let Ok(offset) = offset else {
+                            return Err(NodeError::StorageConnectionError);
+                        };
 
-                            0
+                        let StoragePacket::Store(offset) = offset else {
+                            return Err(NodeError::StorageConnectionError);
                         };
 
                         Ok(Payload::SendOk { offset })
@@ -171,15 +233,26 @@ impl<Input: Read, Output: Write> Node<Input, Output> {
                     Payload::Poll { offsets } => {
                         let mut messages = BTreeMap::new();
                         for (key, offset) in &offsets {
-                            if let Some(v) = self.message_storage.get(key) {
-                                let vals: Vec<[usize; 2]> = v[*offset..]
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, val)| [offset + i, *val])
-                                    .collect();
+                            let v = self.send(ClientPacket::Get {
+                                key: key.clone(),
+                                offset: *offset,
+                            });
 
-                                messages.insert(key.clone(), vals);
-                            }
+                            let Ok(v) = v else {
+                                continue;
+                            };
+
+                            let StoragePacket::Get(v) = v else {
+                                continue;
+                            };
+
+                            let vals: Vec<[usize; 2]> = v
+                                .iter()
+                                .enumerate()
+                                .map(|(i, val)| [offset + i, *val])
+                                .collect();
+
+                            messages.insert(key.clone(), vals);
                         }
 
                         Ok(Payload::PollOk { messages })
